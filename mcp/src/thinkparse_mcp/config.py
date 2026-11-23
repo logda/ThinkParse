@@ -21,6 +21,9 @@ class ConfigError(RuntimeError):
 
 _TRANSPORTS = ("streamable-http", "stdio")
 _MAX_WAIT_S = 120
+# 100 MiB default upload cap; override with MCP_MAX_UPLOAD_BYTES ("" disables).
+_DEFAULT_MAX_UPLOAD_BYTES = "104857600"
+_DEFAULT_DOWNLOAD_DEADLINE_S = "120.0"
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,7 @@ class Settings:
     static_token: str | None = None
     allowed_ports: frozenset[int] = frozenset({80, 443})
     max_upload_bytes: int | None = None
+    download_deadline_s: float = 120.0
     poll_interval_s: float = 1.0
     poll_max_interval_s: float = 5.0
     default_wait_s: int = 30
@@ -102,6 +106,13 @@ class Settings:
         if max_result_chars <= 0:
             raise ConfigError("MCP_MAX_RESULT_CHARS must be positive")
 
+        download_deadline_s = _float(
+            source.get("MCP_DOWNLOAD_DEADLINE_S", _DEFAULT_DOWNLOAD_DEADLINE_S),
+            "MCP_DOWNLOAD_DEADLINE_S",
+        )
+        if download_deadline_s <= 0:
+            raise ConfigError("MCP_DOWNLOAD_DEADLINE_S must be positive")
+
         return cls(
             base_url=base_url,
             api_key=api_key,
@@ -113,7 +124,11 @@ class Settings:
             auth_header=source.get("MCP_AUTH_HEADER", "X-Auth-User"),
             static_token=source.get("MCP_STATIC_TOKEN") or None,
             allowed_ports=allowed_ports,
-            max_upload_bytes=_optional_int(source.get("MCP_MAX_UPLOAD_BYTES"), "MCP_MAX_UPLOAD_BYTES"),
+            max_upload_bytes=_optional_int(
+                source.get("MCP_MAX_UPLOAD_BYTES", _DEFAULT_MAX_UPLOAD_BYTES),
+                "MCP_MAX_UPLOAD_BYTES",
+            ),
+            download_deadline_s=download_deadline_s,
             poll_interval_s=poll_interval_s,
             poll_max_interval_s=_MAX_POLL_INTERVAL_S,
             default_wait_s=default_wait_s,

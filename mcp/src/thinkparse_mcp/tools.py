@@ -19,6 +19,11 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+# Runtime import: the registered parse_document annotates ctx: Context so
+# the SDK injects it, and typing.get_type_hints resolves the annotation
+# against this module's globals.
+from mcp.server.mcpserver import Context
+
 from .client import ThinkParseClient, UpstreamError
 from .config import Settings
 from .observability import Metrics, log_event, monotonic_ms
@@ -153,7 +158,10 @@ async def _download_to_temp(
     size = 0
     head = b""
     client = httpx.AsyncClient(
-        trust_env=False, follow_redirects=False, transport=transport
+        trust_env=False,
+        follow_redirects=False,
+        transport=transport,
+        timeout=httpx.Timeout(60.0, connect=5.0),  # spec §7: read 60s, connect 5s
     )
     response: httpx.Response | None = None
     try:
@@ -163,22 +171,33 @@ async def _download_to_temp(
             )
             if response.is_error:
                 raise ToolError(f"the download failed: HTTP {response.status_code}")
-            async for chunk in response.aiter_bytes(_CHUNK_BYTES):
-                if max_bytes is not None and size + len(chunk) > max_bytes:
-                    raise ToolError(
-                        f"the download exceeds the ThinkParse size limit of "
-                        f"{max_bytes} bytes"
-                    )
-                if len(head) < _HEAD_BYTES:
-                    head = (head + chunk)[:_HEAD_BYTES]
-                fh.write(chunk)
-                sha.update(chunk)
-                size += len(chunk)
+            deadline = time.monotonic() + settings.download_deadline_s
+            async with asyncio.timeout_at(deadline):
+                async for chunk in response.aiter_bytes(_CHUNK_BYTES):
+                    if max_bytes is not None and size + len(chunk) > max_bytes:
+                        raise ToolError(
+                            f"the download exceeds the ThinkParse size limit of "
+                            f"{max_bytes} bytes"
+                        )
+                    if len(head) < _HEAD_BYTES:
+                        head = (head + chunk)[:_HEAD_BYTES]
+                    fh.write(chunk)
+                    sha.update(chunk)
+                    size += len(chunk)
         if sniff_mime(head, ext) is None:
             raise ToolError(
                 f"content does not match the {ext or 'declared'} extension; refusing to upload"
             )
         return path, sha.hexdigest(), size
+    except TimeoutError as exc:
+        path.unlink(missing_ok=True)
+        raise ToolError(
+            f"the download exceeded the {settings.download_deadline_s}s deadline; "
+            "aborting"
+        ) from exc
+    except httpx.TransportError as exc:
+        path.unlink(missing_ok=True)
+        raise ToolError(f"the download failed: {exc}") from exc
     except BaseException:
         path.unlink(missing_ok=True)
         raise
@@ -192,6 +211,15 @@ RESULT_KINDS = ("markdown", "middle_json", "content_list", "images")
 
 # Same charset the gateway accepts for batch ids (see control/gateway.py).
 _BATCH_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_MAX_BATCH_FILES = 100
+
+
+def _attach_created_jobs(exc: ToolError, jobs: list[dict[str, Any]]) -> ToolError:
+    """A mid-batch failure still reports the jobs that were created."""
+    if not jobs:
+        return exc
+    ids = [job["job_id"] for job in jobs]
+    return ToolError(f"{exc}; jobs already created under this batch: {ids}")
 
 
 class Tools:
@@ -245,6 +273,8 @@ class Tools:
         """
         if offset < 0:
             raise ToolError("offset must be a non-negative number of characters")
+        if limit is not None and limit <= 0:
+            raise ToolError("limit must be a positive number of characters (or entries)")
         if kind == "content_list":
             raise ToolError(
                 "v2 未暴露 content_list 独立产物，请用 kind='middle_json'（可配 path 过滤）"
@@ -352,6 +382,10 @@ class Tools:
             )
         if ocr_mode not in OCR_MODES:
             raise ToolError(f"ocr_mode must be one of {list(OCR_MODES)}")
+        if not paths:
+            raise ToolError("paths must contain at least one file")
+        if len(paths) > _MAX_BATCH_FILES:
+            raise ToolError(f"a batch is limited to {_MAX_BATCH_FILES} files")
         start = monotonic_ms()
         jobs: list[dict[str, Any]] = []
         try:
@@ -366,7 +400,9 @@ class Tools:
                     raise ToolError("the gateway created a job without an id")
                 jobs.append({"job_id": job_id, "status": job.get("status", "queued")})
         except UpstreamError as exc:
-            raise _map_upstream_error(exc) from exc
+            raise _attach_created_jobs(_map_upstream_error(exc), jobs) from exc
+        except ToolError as exc:
+            raise _attach_created_jobs(exc, jobs) from exc
         log_event(
             "submit_batch",
             batch_id=batch_id,
@@ -612,7 +648,7 @@ class Tools:
         if not upload_id:
             raise ToolError("the gateway returned an upload without an id")
         await self.client.put_upload_content(
-            upload_id, _file_chunks(source), size
+            upload_id, lambda: _file_chunks(source), size
         )
         completed = await self.client.complete_upload(upload_id, sha256sum)
         file_id = (completed.get("file") or {}).get("id")
@@ -717,6 +753,7 @@ def register_tools(server: "MCPServer", tools: Tools) -> None:
         tier: str = "basic",
         ocr_mode: str = "auto",
         wait_seconds: int | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         return await _counting(
             "parse_document",
@@ -726,6 +763,7 @@ def register_tools(server: "MCPServer", tools: Tools) -> None:
                 tier=tier,
                 ocr_mode=ocr_mode,
                 wait_seconds=wait_seconds,
+                ctx=ctx,
             ),
         )
 

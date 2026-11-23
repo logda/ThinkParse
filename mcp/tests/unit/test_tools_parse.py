@@ -50,8 +50,8 @@ class ParseClient:
         self.calls.append(("create_upload", filename, size, mime_type))
         return {"id": "upload_1", "object": "upload", "status": "pending"}
 
-    async def put_upload_content(self, upload_id, content, size):
-        async for _ in content:
+    async def put_upload_content(self, upload_id, content_factory, size):
+        async for _ in content_factory():
             pass
         self.calls.append(("put", upload_id, size))
 

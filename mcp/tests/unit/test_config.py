@@ -81,7 +81,8 @@ def test_defaults():
     assert settings.max_result_chars == 20000
     assert settings.allowed_ports == frozenset({80, 443})
     assert settings.static_token is None
-    assert settings.max_upload_bytes is None
+    assert settings.max_upload_bytes == 104857600
+    assert settings.download_deadline_s == 120.0
     assert settings.allowed_roots == ()
     assert settings.trusted_proxy_cidrs == (ipaddress.ip_network("10.0.0.0/8"),)
 

@@ -137,7 +137,7 @@ def run(settings: Settings) -> None:
         return
     import uvicorn
 
-    app = server.streamable_http_app(host=settings.host)
+    app = identity_middleware(server.streamable_http_app(host=settings.host), settings)
     uvicorn.run(
         app,
         host=settings.host,

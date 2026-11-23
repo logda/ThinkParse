@@ -98,7 +98,7 @@ async def test_put_upload_streams_with_content_length():
         yield b"lo"
 
     async with make_client(handler) as client:
-        await client.put_upload_content("upload_1", chunks(), 5)
+        await client.put_upload_content("upload_1", chunks, 5)
 
     assert captured["path"] == "/api/v2/uploads/upload_1/content"
     assert captured["length"] == "5"

@@ -41,9 +41,9 @@ class FakeUploadClient:
             "upload_url": "/api/v2/uploads/upload_1/content",
         }
 
-    async def put_upload_content(self, upload_id, content, size):
+    async def put_upload_content(self, upload_id, content_factory, size):
         chunks = []
-        async for chunk in content:
+        async for chunk in content_factory():
             chunks.append(chunk)
         self.put_content = b"".join(chunks)
         self.calls.append(("put", upload_id, size))

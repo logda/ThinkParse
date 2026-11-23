@@ -8,7 +8,7 @@ with a backoff; anything else is mapped to UpstreamError for the tools layer.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
@@ -64,7 +64,7 @@ class ThinkParseClient:
         path: str,
         *,
         json: dict[str, Any] | None = None,
-        content: AsyncIterator[bytes] | None = None,
+        content_factory: Callable[[], AsyncIterator[bytes]] | None = None,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
     ) -> httpx.Response:
@@ -74,7 +74,12 @@ class ThinkParseClient:
             response: httpx.Response | None = None
             try:
                 response = await self._http.request(
-                    method, path, json=json, content=content, headers=headers, params=params
+                    method,
+                    path,
+                    json=json,
+                    content=None if content_factory is None else content_factory(),
+                    headers=headers,
+                    params=params,
                 )
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 connect_error = exc
@@ -125,13 +130,19 @@ class ThinkParseClient:
     async def put_upload_content(
         self,
         upload_id: str,
-        content: AsyncIterator[bytes],
+        content_factory: Callable[[], AsyncIterator[bytes]],
         size: int,
     ) -> None:
+        """PUT the upload body; a factory rebuilds the stream per attempt.
+
+        A one-shot async generator cannot be replayed, so retries (connect
+        errors, 5xx) re-open the file rather than sending an empty body under
+        the original Content-Length.
+        """
         await self._request(
             "PUT",
             f"/api/v2/uploads/{upload_id}/content",
-            content=content,
+            content_factory=content_factory,
             headers={"Content-Length": str(size)},
         )
 

@@ -27,7 +27,11 @@ def configure_logging(level: str) -> None:
 
 
 def log_event(event: str, **fields: Any) -> None:
-    """Write one JSON line to stdout: ts, level, event first, then field order."""
+    """Write one JSON line to stderr: ts, level, event first, then fields.
+
+    stderr keeps the stdio transport's protocol stream on stdout clean —
+    stdout carries MCP JSON-RPC messages only.
+    """
     level = str(fields.pop("level", "INFO")).upper()
     if _LEVELS.get(level, 20) < _threshold:
         return
@@ -37,7 +41,7 @@ def log_event(event: str, **fields: Any) -> None:
         "event": event,
     }
     body.update(fields)
-    print(json.dumps(body, ensure_ascii=False, default=str), file=sys.stdout, flush=True)
+    print(json.dumps(body, ensure_ascii=False, default=str), file=sys.stderr, flush=True)
 
 
 class Metrics:

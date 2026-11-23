@@ -7,7 +7,9 @@ from thinkparse_mcp.observability import Metrics, configure_logging, log_event
 
 def test_log_event_writes_single_json_line(capsys):
     log_event("tool_call", tool="parse_document", status="completed", level="INFO")
-    lines = capsys.readouterr().out.strip().splitlines()
+    out, err = capsys.readouterr()
+    assert out == ""  # stdout carries MCP protocol only (stdio transport)
+    lines = err.strip().splitlines()
     assert len(lines) == 1
     body = json.loads(lines[0])
     assert body["event"] == "tool_call"
@@ -21,9 +23,9 @@ def test_log_event_respects_level_filter(capsys):
     try:
         configure_logging("ERROR")
         log_event("tool_call", level="INFO")
-        assert capsys.readouterr().out == ""
+        assert capsys.readouterr().err == ""
         log_event("upstream_error", level="ERROR", error_code=503)
-        assert json.loads(capsys.readouterr().out)["event"] == "upstream_error"
+        assert json.loads(capsys.readouterr().err)["event"] == "upstream_error"
     finally:
         configure_logging("INFO")
 
