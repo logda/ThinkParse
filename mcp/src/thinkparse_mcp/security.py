@@ -7,6 +7,7 @@ guards appended by Task 5.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import ipaddress
 import re
 from pathlib import Path
@@ -208,3 +209,40 @@ async def _guard_host(host: str, resolver) -> None:
         ipaddress.ip_address(host)
     except ValueError:
         await resolve_public_host(host, resolver=resolver)
+
+
+# --- caller identity (trusted proxy + static token) -------------------------
+
+
+def _in_trusted_cidrs(peer_ip: str, cidrs) -> bool:
+    try:
+        addr = ipaddress.ip_address(peer_ip)
+    except ValueError:
+        return False
+    return any(addr in network for network in cidrs)
+
+
+def caller_identity(
+    headers,
+    peer_ip: str,
+    cidrs,
+    auth_header: str,
+    static_token: str | None,
+) -> str:
+    """Resolve the calling identity for the HTTP transport (spec §8).
+
+    The client-supplied identity header is honored only when the TCP peer is
+    inside a trusted proxy CIDR; anything else must present the static token.
+    """
+    if _in_trusted_cidrs(peer_ip, cidrs):
+        return headers.get(auth_header) or "anonymous"
+    if static_token is None:
+        raise SecurityError(
+            "the request is not from a trusted proxy and no static token is "
+            "configured; refusing to trust client-supplied credentials"
+        )
+    presented = headers.get("authorization") or ""
+    expected = f"Bearer {static_token}"
+    if not hmac.compare_digest(presented.encode(), expected.encode()):
+        raise SecurityError("invalid or missing static token")
+    return "static"

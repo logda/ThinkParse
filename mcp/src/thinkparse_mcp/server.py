@@ -9,16 +9,17 @@ imports what does not exist yet.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mcp.server.mcpserver import MCPServer
-from starlette.applications import Starlette
+from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 
 from .client import ThinkParseClient
 from .config import Settings
 from .observability import Metrics
+from .security import SecurityError, caller_identity
 
 if TYPE_CHECKING:
     from .tools import Tools
@@ -76,15 +77,47 @@ def create_mcp(
     return server
 
 
+def identity_middleware(app, settings: Settings):
+    """Pure ASGI wrapper: authenticate /mcp, leave every other path alone.
+
+    The resolved identity lands in ``scope["state"]["user"]`` for logging;
+    stdio has no middleware path, so tools log ``local`` there instead.
+    """
+
+    async def middleware(scope, receive, send):
+        if scope["type"] != "http" or scope.get("path", "") != "/mcp":
+            await app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        peer_ip = (scope.get("client") or ("", 0))[0]
+        try:
+            user = caller_identity(
+                headers,
+                peer_ip,
+                settings.trusted_proxy_cidrs,
+                settings.auth_header,
+                settings.static_token,
+            )
+        except SecurityError as exc:
+            response = JSONResponse({"error": str(exc)}, status_code=401)
+            await response(scope, receive, send)
+            return
+        scope.setdefault("state", {})["user"] = user
+        await app(scope, receive, send)
+
+    return middleware
+
+
 def build_app(
     settings: Settings,
     tools: "Tools | None" = None,
     client: ThinkParseClient | None = None,
     metrics: Metrics | None = None,
-) -> Starlette:
-    """Return the streamable-HTTP Starlette app for this server."""
+) -> Any:
+    """Return the streamable-HTTP ASGI app (identity-wrapped) for this server."""
     server = create_mcp(settings, tools=tools, client=client, metrics=metrics)
-    return server.streamable_http_app(host=settings.host)
+    app = server.streamable_http_app(host=settings.host)
+    return identity_middleware(app, settings)
 
 
 def run(settings: Settings) -> None:
