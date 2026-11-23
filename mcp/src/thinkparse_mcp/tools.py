@@ -7,6 +7,7 @@ model reads (spec §6). All upstream HTTP goes through ThinkParseClient.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import tempfile
@@ -220,6 +221,98 @@ class Tools:
             raise _map_upstream_error(exc) from exc
         return {"job_id": body.get("job_id", job_id), "status": body.get("status", "canceled")}
 
+    async def _wait_for_terminal(
+        self, job_id: str, wait_seconds: int, ctx: Any = None
+    ) -> dict[str, Any]:
+        """Poll get_job until a terminal state or the caller's budget runs out."""
+        interval = self.settings.poll_interval_s
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            job = await self.client.get_job(job_id)
+            if job.get("status") in TERMINAL_STATES:
+                return job
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return job
+            if ctx is not None:
+                elapsed = min(wait_seconds, int(wait_seconds - remaining))
+                await ctx.report_progress(elapsed, total=wait_seconds)
+            await asyncio.sleep(min(interval, remaining))
+            interval = min(interval * 1.5, self.settings.poll_max_interval_s)
+
+    async def parse_document(
+        self,
+        path: str | None = None,
+        url: str | None = None,
+        tier: str = "basic",
+        ocr_mode: str = "auto",
+        wait_seconds: int | None = None,
+        ctx: Any = None,
+    ) -> dict[str, Any]:
+        """Upload a document, submit it, and wait within the given budget.
+
+        The return contract is spec §6.1: a failed job is a normal return with
+        `error` populated, never a raised error.
+        """
+        if ocr_mode not in OCR_MODES:
+            raise ToolError(f"ocr_mode must be one of {list(OCR_MODES)}")
+        if wait_seconds is None:
+            wait_seconds = self.settings.default_wait_s
+        wait_seconds = max(0, min(int(wait_seconds), self.settings.max_wait_s))
+        start = monotonic_ms()
+        try:
+            await self.tiers.validate(tier)
+            file_id, sha, size = await self._source_to_file(path, url)
+            job = await self.client.create_job(file_id, tier, ocr_mode)
+            job_id = job.get("job_id")
+            if not job_id:
+                raise ToolError("the gateway created a job without an id")
+            if wait_seconds > 0:
+                job = await self._wait_for_terminal(job_id, wait_seconds, ctx=ctx)
+            payload = {}
+            if job.get("status") == "completed":
+                outputs = (job.get("files") or [{}])[0].get("output_files") or {}
+                markdown = outputs.get("markdown")
+                if markdown and markdown.get("file_id"):
+                    text = await self.client.get_file_text(str(markdown["file_id"]))
+                    limit = self.settings.max_result_chars
+                    payload = {
+                        "summary": text[:limit],
+                        "truncated": len(text) > limit,
+                    }
+        except UpstreamError as exc:
+            raise _map_upstream_error(exc) from exc
+        view = _job_view(job)
+        status = view["status"]
+        hint = (
+            None
+            if status in TERMINAL_STATES
+            else f"job still running; call get_job(job_id={view['job_id']})"
+        )
+        result: dict[str, Any] = {
+            "job_id": view["job_id"],
+            "status": status,
+            "tier": view["tier"],
+            "attempt": view["attempt"],
+            "pages": view["pages"],
+            "timing": view["timing"],
+            "files": view["files"],
+            "error": view["error"],
+            "hint": hint,
+            "truncated": False,
+        }
+        result.update(payload)
+        log_event(
+            "parse_document",
+            file_sha256=sha,
+            bytes=size,
+            tier=tier,
+            ocr_mode=ocr_mode,
+            status=status,
+            duration_ms=round(monotonic_ms() - start, 1),
+        )
+        return result
+
     async def _source_to_file(
         self, path: str | None, url: str | None
     ) -> tuple[str, str, int]:
@@ -319,6 +412,16 @@ _CANCEL_JOB_DESCRIPTION = (
 )
 
 
+_PARSE_DOCUMENT_DESCRIPTION = (
+    "Parse a document into markdown and structured JSON. Upload a local file "
+    "(path) or fetch a URL (url) — exactly one of the two — then submit it to "
+    "ThinkParse and wait up to wait_seconds for the result. wait_seconds=0 "
+    "returns immediately with the job id; poll with get_job afterwards. A "
+    "failed parse is returned as status='failed' with error details, not as "
+    "an exception."
+)
+
+
 def register_tools(server: "MCPServer", tools: Tools) -> None:
     """Attach the Tools instance to an MCPServer with timing/metrics."""
 
@@ -348,3 +451,22 @@ def register_tools(server: "MCPServer", tools: Tools) -> None:
     @server.tool(name="cancel_job", description=_CANCEL_JOB_DESCRIPTION)
     async def cancel_job(job_id: str) -> dict[str, Any]:
         return await _counting("cancel_job", lambda: tools.cancel_job(job_id))
+
+    @server.tool(name="parse_document", description=_PARSE_DOCUMENT_DESCRIPTION)
+    async def parse_document(
+        path: str | None = None,
+        url: str | None = None,
+        tier: str = "basic",
+        ocr_mode: str = "auto",
+        wait_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        return await _counting(
+            "parse_document",
+            lambda: tools.parse_document(
+                path=path,
+                url=url,
+                tier=tier,
+                ocr_mode=ocr_mode,
+                wait_seconds=wait_seconds,
+            ),
+        )
