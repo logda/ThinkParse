@@ -179,21 +179,26 @@ async def fetch_public(
     allowed_ports: frozenset[int] = _DEFAULT_ALLOWED_PORTS,
     resolver=None,
 ) -> httpx.Response:
-    """Fetch with manual redirect following: every hop is re-validated."""
+    """Fetch with manual redirect following: every hop is re-validated.
+
+    The response is streamed (not buffered) so callers can enforce download
+    size limits while reading; the caller must `await response.aclose()`.
+    """
     current = validate_url(str(url), allowed_ports)
     redirects = 0
     while True:
         await _guard_host(current.host, resolver)
-        response = await client.get(current, follow_redirects=False)
+        request = client.build_request("GET", current)
+        response = await client.send(request, stream=True)
         if response.has_redirect_location:
+            location = response.headers["location"]
+            await response.aclose()
             redirects += 1
             if redirects > max_hops:
                 raise SecurityError(
                     f"more than {max_hops} redirects while fetching {url}"
                 )
-            current = validate_url(
-                str(current.join(response.headers["location"])), allowed_ports
-            )
+            current = validate_url(str(current.join(location)), allowed_ports)
             continue
         return response
 

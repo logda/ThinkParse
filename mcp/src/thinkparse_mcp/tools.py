@@ -7,12 +7,19 @@ model reads (spec §6). All upstream HTTP goes through ThinkParseClient.
 
 from __future__ import annotations
 
+import hashlib
+import os
+import tempfile
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+import httpx
 
 from .client import ThinkParseClient, UpstreamError
 from .config import Settings
 from .observability import Metrics, log_event, monotonic_ms
+from .security import SecurityError, fetch_public, resolve_local_path, sniff_mime
 
 if TYPE_CHECKING:
     from mcp.server.mcpserver import MCPServer
@@ -103,6 +110,81 @@ def _map_upstream_error(exc: UpstreamError) -> ToolError:
     return ToolError(str(exc))
 
 
+_CHUNK_BYTES = 1024 * 1024
+_HEAD_BYTES = 32
+
+
+def _ext_and_name(url: str) -> tuple[str, str]:
+    """Filename and extension from a URL's path."""
+    name = httpx.URL(url).path.rsplit("/", 1)[-1] or "download"
+    ext = Path(name).suffix
+    return ext, name
+
+
+async def _file_chunks(path: Path) -> Any:
+    """Yield a file's bytes in upload-sized chunks."""
+    with open(path, "rb") as fh:
+        while chunk := fh.read(_CHUNK_BYTES):
+            yield chunk
+
+
+async def _download_to_temp(
+    url: str,
+    settings: Settings,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    resolver=None,
+    temp_dir: Path | None = None,
+) -> tuple[Path, str, int]:
+    """Download a URL into a 0600 temp file with size and content checks.
+
+    Returns (path, sha256sum, size); the caller deletes the temp file. On any
+    rejection (oversize, magic-number mismatch, fetch failure) the temp file
+    is removed here. Every hop is re-validated by fetch_public (spec §8).
+    """
+    max_bytes = settings.max_upload_bytes
+    ext, _ = _ext_and_name(url)
+    fd, name = tempfile.mkstemp(dir=None if temp_dir is None else str(temp_dir))
+    path = Path(name)
+    sha = hashlib.sha256()
+    size = 0
+    head = b""
+    client = httpx.AsyncClient(
+        trust_env=False, follow_redirects=False, transport=transport
+    )
+    response: httpx.Response | None = None
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            response = await fetch_public(
+                url, client, allowed_ports=settings.allowed_ports, resolver=resolver
+            )
+            if response.is_error:
+                raise ToolError(f"the download failed: HTTP {response.status_code}")
+            async for chunk in response.aiter_bytes(_CHUNK_BYTES):
+                if max_bytes is not None and size + len(chunk) > max_bytes:
+                    raise ToolError(
+                        f"the download exceeds the ThinkParse size limit of "
+                        f"{max_bytes} bytes"
+                    )
+                if len(head) < _HEAD_BYTES:
+                    head = (head + chunk)[:_HEAD_BYTES]
+                fh.write(chunk)
+                sha.update(chunk)
+                size += len(chunk)
+        if sniff_mime(head, ext) is None:
+            raise ToolError(
+                f"content does not match the {ext or 'declared'} extension; refusing to upload"
+            )
+        return path, sha.hexdigest(), size
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    finally:
+        if response is not None:
+            await response.aclose()
+        await client.aclose()
+
+
 class Tools:
     """Tool bodies; one instance per server process."""
 
@@ -137,6 +219,87 @@ class Tools:
         except UpstreamError as exc:
             raise _map_upstream_error(exc) from exc
         return {"job_id": body.get("job_id", job_id), "status": body.get("status", "canceled")}
+
+    async def _source_to_file(
+        self, path: str | None, url: str | None
+    ) -> tuple[str, str, int]:
+        """Turn a local path or URL into a ThinkParse file id.
+
+        Returns (file_id, sha256sum, size). The upload is the gateway's three
+        steps — create, PUT content, complete — with the sha256 sent on create
+        so a known blob short-circuits to a completed upload (spec §6.4).
+        """
+        if (path is None) == (url is None):
+            raise ToolError("provide exactly one of path or url")
+        try:
+            return await self._upload_source(path, url)
+        except SecurityError as exc:
+            raise ToolError(str(exc)) from exc
+        except UpstreamError as exc:
+            raise _map_upstream_error(exc) from exc
+
+    async def _upload_source(
+        self, path: str | None, url: str | None
+    ) -> tuple[str, str, int]:
+        if url is not None:
+            ext, name = _ext_and_name(url)
+            temp, sha, size = await _download_to_temp(url, self.settings)
+            try:
+                with open(temp, "rb") as fh:
+                    head = fh.read(_HEAD_BYTES)
+                mime = sniff_mime(head, ext)
+                if mime is None:  # already validated by the download; belt and braces
+                    raise ToolError("content does not match the declared extension")
+                return await self._three_step_upload(temp, name, mime, sha, size)
+            finally:
+                temp.unlink(missing_ok=True)
+        assert path is not None
+        resolved = resolve_local_path(path, self.settings.allowed_roots)
+        sha = hashlib.sha256()
+        size = 0
+        head = b""
+        with open(resolved, "rb") as fh:
+            while chunk := fh.read(_CHUNK_BYTES):
+                sha.update(chunk)
+                size += len(chunk)
+                if len(head) < _HEAD_BYTES:
+                    head = (head + chunk)[:_HEAD_BYTES]
+        mime = sniff_mime(head, resolved.suffix)
+        if mime is None:
+            raise ToolError(
+                f"content does not match the {resolved.suffix or 'declared'} extension; "
+                "refusing to upload"
+            )
+        return await self._three_step_upload(
+            resolved, resolved.name, mime, sha.hexdigest(), size
+        )
+
+    async def _three_step_upload(
+        self,
+        source: Path,
+        filename: str,
+        mime_type: str,
+        sha256sum: str,
+        size: int,
+    ) -> tuple[str, str, int]:
+        created = await self.client.create_upload(
+            filename, size, mime_type, sha256sum=sha256sum
+        )
+        existing = created.get("file") or {}
+        file_id = existing.get("id")
+        if created.get("status") == "completed" and file_id:
+            return str(file_id), sha256sum, size
+        upload_id = created.get("id")
+        if not upload_id:
+            raise ToolError("the gateway returned an upload without an id")
+        await self.client.put_upload_content(
+            upload_id, _file_chunks(source), size
+        )
+        completed = await self.client.complete_upload(upload_id, sha256sum)
+        file_id = (completed.get("file") or {}).get("id")
+        if not file_id:
+            raise ToolError("the upload completed without a file id")
+        return str(file_id), sha256sum, size
 
 
 _LIST_TIERS_DESCRIPTION = (
