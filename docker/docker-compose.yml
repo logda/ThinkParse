@@ -217,6 +217,24 @@ services:
     restart: unless-stopped
     command: ["python", "-m", "control.reconciler"]
 
+  mcp:
+    build:
+      context: ../mcp
+      dockerfile: Dockerfile
+    image: thinkparse-mcp:0.1.0
+    environment:
+      THINKPARSE_BASE_URL: http://gateway:8000
+      THINKPARSE_API_KEY: ${THINKPARSE_API_KEY:-}
+      MCP_TRANSPORT: streamable-http
+      MCP_TRUSTED_PROXY_CIDRS: ${MCP_TRUSTED_PROXY_CIDRS:-10.0.0.0/8}
+    ports: ["127.0.0.1:8765:8765"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    depends_on:
+      gateway:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   thinkparse_pg:
   thinkparse_objects:
