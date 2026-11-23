@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import tempfile
 import time
@@ -186,6 +187,9 @@ async def _download_to_temp(
         await client.aclose()
 
 
+RESULT_KINDS = ("markdown", "middle_json", "content_list", "images")
+
+
 class Tools:
     """Tool bodies; one instance per server process."""
 
@@ -220,6 +224,110 @@ class Tools:
         except UpstreamError as exc:
             raise _map_upstream_error(exc) from exc
         return {"job_id": body.get("job_id", job_id), "status": body.get("status", "canceled")}
+
+    async def get_result(
+        self,
+        job_id: str,
+        kind: str = "markdown",
+        offset: int = 0,
+        limit: int | None = None,
+        path: str | None = None,
+    ) -> dict[str, Any]:
+        """Page through a completed job's outputs (spec §6.3).
+
+        Text kinds fetch the whole file from the gateway and slice client-side
+        (the gateway has no range support); slicing is by Python codepoint, so
+        emoji and CJK never split mid-character.
+        """
+        if offset < 0:
+            raise ToolError("offset must be a non-negative number of characters")
+        if kind == "content_list":
+            raise ToolError(
+                "v2 未暴露 content_list 独立产物，请用 kind='middle_json'（可配 path 过滤）"
+            )
+        if kind not in RESULT_KINDS:
+            raise ToolError(
+                f"kind must be one of {list(RESULT_KINDS)}, got {kind!r}"
+            )
+        try:
+            job = await self.client.get_job(job_id)
+        except UpstreamError as exc:
+            raise _map_upstream_error(exc) from exc
+        if job.get("status") != "completed":
+            raise ToolError(
+                f"job {job_id} is {job.get('status')}; call get_job(job_id={job_id}) "
+                "until it is completed"
+            )
+        outputs = (job.get("files") or [{}])[0].get("output_files") or {}
+        if kind == "images":
+            return self._image_page(job_id, outputs, offset, limit)
+        file_id = (outputs.get(kind) or {}).get("file_id")
+        if not file_id:
+            raise ToolError(
+                f"job {job_id} has no {kind} output; call get_job(job_id={job_id}) "
+                "to list what it produced"
+            )
+        try:
+            text = await self.client.get_file_text(str(file_id))
+        except UpstreamError as exc:
+            raise _map_upstream_error(exc) from exc
+        if kind == "middle_json" and path:
+            text = self._json_subtree(text, path)
+        max_chars = self.settings.max_result_chars
+        page_limit = max_chars if limit is None else min(int(limit), max_chars)
+        total = len(text)
+        page = text[offset : offset + page_limit]
+        end = offset + page_limit
+        return {
+            "kind": kind,
+            "total_chars": total,
+            "offset": offset,
+            "next_offset": end if end < total else None,
+            "text": page,
+            "items": None,
+            "eof": end >= total,
+        }
+
+    def _image_page(
+        self, job_id: str, outputs: dict[str, Any], offset: int, limit: int | None
+    ) -> dict[str, Any]:
+        images = outputs.get("images") or []
+        page_limit = DEFAULT_LIST_LIMIT if limit is None else min(int(limit), MAX_LIST_LIMIT)
+        end = offset + page_limit
+        items = [
+            {
+                "filename": image.get("filename"),
+                "bytes": image.get("bytes"),
+                "uri": f"thinkparse://jobs/{job_id}/images/{image.get('filename')}",
+            }
+            for image in images[offset:end]
+        ]
+        total = len(images)
+        return {
+            "kind": "images",
+            "total_chars": total,
+            "offset": offset,
+            "next_offset": end if end < total else None,
+            "text": None,
+            "items": items,
+            "eof": end >= total,
+        }
+
+    @staticmethod
+    def _json_subtree(text: str, path: str) -> str:
+        """Extract a dot-path subtree from JSON text and re-serialize it."""
+        try:
+            value: Any = json.loads(text)
+            for part in path.split("."):
+                if isinstance(value, dict):
+                    value = value[part]
+                elif isinstance(value, list) and part.lstrip("-").isdigit():
+                    value = value[int(part)]
+                else:
+                    raise KeyError(part)
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise ToolError(f"path {path!r} does not resolve in the middle_json") from exc
+        return json.dumps(value, ensure_ascii=False)
 
     async def _wait_for_terminal(
         self, job_id: str, wait_seconds: int, ctx: Any = None
@@ -422,6 +530,15 @@ _PARSE_DOCUMENT_DESCRIPTION = (
 )
 
 
+_GET_RESULT_DESCRIPTION = (
+    "Read a completed job's outputs, paginated. kind='markdown' or "
+    "'middle_json' returns text sliced by character offset/limit (limit caps "
+    "at the server's max_result_chars); kind='middle_json' also accepts a dot "
+    "path to return one subtree. kind='images' pages the image list by "
+    "entries. Use the returned next_offset to continue; eof=true means done."
+)
+
+
 def register_tools(server: "MCPServer", tools: Tools) -> None:
     """Attach the Tools instance to an MCPServer with timing/metrics."""
 
@@ -468,5 +585,20 @@ def register_tools(server: "MCPServer", tools: Tools) -> None:
                 tier=tier,
                 ocr_mode=ocr_mode,
                 wait_seconds=wait_seconds,
+            ),
+        )
+
+    @server.tool(name="get_result", description=_GET_RESULT_DESCRIPTION)
+    async def get_result(
+        job_id: str,
+        kind: str = "markdown",
+        offset: int = 0,
+        limit: int | None = None,
+        path: str | None = None,
+    ) -> dict[str, Any]:
+        return await _counting(
+            "get_result",
+            lambda: tools.get_result(
+                job_id, kind=kind, offset=offset, limit=limit, path=path
             ),
         )
