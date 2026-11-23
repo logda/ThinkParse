@@ -66,6 +66,7 @@ class ThinkParseClient:
         json: dict[str, Any] | None = None,
         content: AsyncIterator[bytes] | None = None,
         headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
     ) -> httpx.Response:
         attempts = 0
         while True:
@@ -73,7 +74,7 @@ class ThinkParseClient:
             response: httpx.Response | None = None
             try:
                 response = await self._http.request(
-                    method, path, json=json, content=content, headers=headers
+                    method, path, json=json, content=content, headers=headers, params=params
                 )
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 connect_error = exc
@@ -176,6 +177,25 @@ class ThinkParseClient:
     async def get_file_text(self, file_id: str) -> str:
         response = await self._request("GET", f"/api/v2/files/{file_id}/content")
         return response.text
+
+    async def get_file_bytes(self, file_id: str) -> bytes:
+        response = await self._request("GET", f"/api/v2/files/{file_id}/content")
+        return response.content
+
+    async def get_batch(self, batch_id: str) -> dict[str, Any]:
+        response = await self._request("GET", f"/api/v2/batches/{batch_id}")
+        return response.json()
+
+    async def get_batch_jobs(
+        self, batch_id: str, status: str | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if status is not None:
+            params["status"] = status
+        response = await self._request(
+            "GET", f"/api/v2/batches/{batch_id}/jobs", params=params
+        )
+        return response.json()
 
 
 def _detail(response: httpx.Response) -> str:

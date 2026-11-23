@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -189,6 +190,9 @@ async def _download_to_temp(
 
 RESULT_KINDS = ("markdown", "middle_json", "content_list", "images")
 
+# Same charset the gateway accepts for batch ids (see control/gateway.py).
+_BATCH_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
 
 class Tools:
     """Tool bodies; one instance per server process."""
@@ -328,6 +332,120 @@ class Tools:
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise ToolError(f"path {path!r} does not resolve in the middle_json") from exc
         return json.dumps(value, ensure_ascii=False)
+
+    async def submit_batch(
+        self,
+        paths: list[str],
+        batch_id: str,
+        tier: str = "basic",
+        ocr_mode: str = "auto",
+    ) -> dict[str, Any]:
+        """Upload several local files and submit them under one batch id.
+
+        Each path is uploaded through the same three-step pipeline as
+        parse_document and submitted with the shared batch_id; the jobs start
+        queued and are polled individually with get_job / get_batch.
+        """
+        if not _BATCH_ID_RE.fullmatch(batch_id):
+            raise ToolError(
+                "batch_id must be 1-64 characters of letters, digits, '_' or '-'"
+            )
+        if ocr_mode not in OCR_MODES:
+            raise ToolError(f"ocr_mode must be one of {list(OCR_MODES)}")
+        start = monotonic_ms()
+        jobs: list[dict[str, Any]] = []
+        try:
+            await self.tiers.validate(tier)
+            for path in paths:
+                file_id, _sha, _size = await self._source_to_file(path, None)
+                job = await self.client.create_job(
+                    file_id, tier, ocr_mode, batch_id=batch_id
+                )
+                job_id = job.get("job_id")
+                if not job_id:
+                    raise ToolError("the gateway created a job without an id")
+                jobs.append({"job_id": job_id, "status": job.get("status", "queued")})
+        except UpstreamError as exc:
+            raise _map_upstream_error(exc) from exc
+        log_event(
+            "submit_batch",
+            batch_id=batch_id,
+            files=len(paths),
+            tier=tier,
+            duration_ms=round(monotonic_ms() - start, 1),
+        )
+        return {"batch_id": batch_id, "jobs": jobs}
+
+    async def get_batch(self, batch_id: str) -> dict[str, Any]:
+        """Summarize one batch: status counts plus its jobs with errors."""
+        try:
+            batch = await self.client.get_batch(batch_id)
+            listing = await self.client.get_batch_jobs(batch_id)
+        except UpstreamError as exc:
+            raise _map_upstream_error(exc) from exc
+        jobs: list[dict[str, Any]] = []
+        for entry in listing.get("data") or []:
+            view: dict[str, Any] = {
+                "job_id": entry.get("job_id"),
+                "status": entry.get("status"),
+            }
+            error = (entry.get("files") or [{}])[0].get("error")
+            if error:
+                view["error"] = error
+            jobs.append(view)
+        return {**batch, "jobs": jobs}
+
+    async def job_markdown(self, job_id: str) -> str:
+        """Full markdown of a completed job, truncated at max_result_chars."""
+        outputs = await self._completed_outputs(job_id)
+        file_id = (outputs.get("markdown") or {}).get("file_id")
+        if not file_id:
+            raise ToolError(
+                f"job {job_id} has no markdown output; call get_job(job_id={job_id}) "
+                "to list what it produced"
+            )
+        try:
+            text = await self.client.get_file_text(str(file_id))
+        except UpstreamError as exc:
+            raise _map_upstream_error(exc) from exc
+        limit = self.settings.max_result_chars
+        if len(text) > limit:
+            return (
+                text[:limit]
+                + f"\n\n[truncated: showing {limit} of {len(text)} characters; "
+                "continue with get_result pagination]"
+            )
+        return text
+
+    async def job_image(self, job_id: str, name: str) -> bytes:
+        """One image output of a completed job, as raw bytes."""
+        outputs = await self._completed_outputs(job_id)
+        file_id = next(
+            (
+                image.get("file_id")
+                for image in outputs.get("images") or []
+                if image.get("filename") == name
+            ),
+            None,
+        )
+        if not file_id:
+            raise ToolError(f"job {job_id} has no image named {name!r}")
+        try:
+            return await self.client.get_file_bytes(str(file_id))
+        except UpstreamError as exc:
+            raise _map_upstream_error(exc) from exc
+
+    async def _completed_outputs(self, job_id: str) -> dict[str, Any]:
+        try:
+            job = await self.client.get_job(job_id)
+        except UpstreamError as exc:
+            raise _map_upstream_error(exc) from exc
+        if job.get("status") != "completed":
+            raise ToolError(
+                f"job {job_id} is {job.get('status')}; call get_job(job_id={job_id}) "
+                "until it is completed"
+            )
+        return (job.get("files") or [{}])[0].get("output_files") or {}
 
     async def _wait_for_terminal(
         self, job_id: str, wait_seconds: int, ctx: Any = None
@@ -538,6 +656,29 @@ _GET_RESULT_DESCRIPTION = (
     "entries. Use the returned next_offset to continue; eof=true means done."
 )
 
+_SUBMIT_BATCH_DESCRIPTION = (
+    "Parse several local files under one batch: uploads each path, submits "
+    "each as a job sharing the same batch_id (1-64 chars of letters, digits, "
+    "'_' or '-'), and returns the created job ids. Poll individual jobs with "
+    "get_job, or summarize the whole batch with get_batch."
+)
+
+_GET_BATCH_DESCRIPTION = (
+    "Summarize a batch: per-status job counts, pages completed, and the list "
+    "of its jobs — with error details for the failed ones."
+)
+
+_MARKDOWN_RESOURCE_DESCRIPTION = (
+    "The full markdown output of a completed parse job, as text. Content "
+    "beyond the server's max_result_chars is cut with a note pointing at "
+    "the get_result tool for pagination."
+)
+
+_IMAGE_RESOURCE_DESCRIPTION = (
+    "One image output of a completed parse job, as raw bytes; name is the "
+    "image filename as listed by get_result(kind='images')."
+)
+
 
 def register_tools(server: "MCPServer", tools: Tools) -> None:
     """Attach the Tools instance to an MCPServer with timing/metrics."""
@@ -602,3 +743,37 @@ def register_tools(server: "MCPServer", tools: Tools) -> None:
                 job_id, kind=kind, offset=offset, limit=limit, path=path
             ),
         )
+
+    @server.tool(name="submit_batch", description=_SUBMIT_BATCH_DESCRIPTION)
+    async def submit_batch(
+        paths: list[str],
+        batch_id: str,
+        tier: str = "basic",
+        ocr_mode: str = "auto",
+    ) -> dict[str, Any]:
+        return await _counting(
+            "submit_batch",
+            lambda: tools.submit_batch(
+                paths, batch_id, tier=tier, ocr_mode=ocr_mode
+            ),
+        )
+
+    @server.tool(name="get_batch", description=_GET_BATCH_DESCRIPTION)
+    async def get_batch(batch_id: str) -> dict[str, Any]:
+        return await _counting("get_batch", lambda: tools.get_batch(batch_id))
+
+    @server.resource(
+        "thinkparse://jobs/{job_id}/markdown",
+        name="job_markdown",
+        description=_MARKDOWN_RESOURCE_DESCRIPTION,
+    )
+    async def job_markdown(job_id: str) -> str:
+        return await tools.job_markdown(job_id)
+
+    @server.resource(
+        "thinkparse://jobs/{job_id}/images/{name}",
+        name="job_image",
+        description=_IMAGE_RESOURCE_DESCRIPTION,
+    )
+    async def job_image(job_id: str, name: str) -> bytes:
+        return await tools.job_image(job_id, name)
