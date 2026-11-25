@@ -15,11 +15,15 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 ARG MINERU_VERSION=4.0.10
+# docvortex 0.6.x changed the NativeTextSnapshot.prepare_span_texts signature
+# (private_ranges became a tuple of ranges) and breaks mineru 4.0.10's flat
+# (start, end) pair. Stay on 0.5.x until mineru is upgraded.
+ARG DOCVORTEX_VERSION=0.5.18
 ARG MINERU_GPU_TIER=standard
 ARG MINERU_DOWNLOAD_SOURCE=modelscope
 ARG PIP_INDEX_URL=https://pypi.org/simple
 
-RUN python3 -m pip install -U "mineru[torch]==${MINERU_VERSION}" -i "${PIP_INDEX_URL}" --break-system-packages && \
+RUN python3 -m pip install -U "mineru[torch]==${MINERU_VERSION}" "docvortex==${DOCVORTEX_VERSION}" -i "${PIP_INDEX_URL}" --break-system-packages && \
     python3 -m pip cache purge
 
 ENV MINERU_MODEL_SMALL_BACKEND=torch \

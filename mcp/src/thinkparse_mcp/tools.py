@@ -23,6 +23,7 @@ import httpx
 # the SDK injects it, and typing.get_type_hints resolves the annotation
 # against this module's globals.
 from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError as SDKToolError
 
 from .client import ThinkParseClient, UpstreamError
 from .config import Settings
@@ -33,12 +34,20 @@ if TYPE_CHECKING:
     from mcp.server.mcpserver import MCPServer
 
 
-class ToolError(Exception):
-    """An error whose message is safe and useful for the calling model."""
+class ToolError(SDKToolError):
+    """An error whose message is safe and useful for the calling model.
+
+    Subclasses the SDK's ToolError so the server surfaces the message to the
+    client (is_error=True) instead of the generic crash text.
+    """
 
 
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 OCR_MODES = ("auto", "txt", "ocr")
+UPLOAD_HINT = (
+    "upload the file with PUT /uploads?filename=<name> (same Bearer token, "
+    "raw body, Content-Length required), then pass the returned file_id"
+)
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 500
 
@@ -365,16 +374,18 @@ class Tools:
 
     async def submit_batch(
         self,
-        paths: list[str],
-        batch_id: str,
+        paths: list[str] | None = None,
+        batch_id: str = "",
         tier: str = "basic",
         ocr_mode: str = "auto",
+        file_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Upload several local files and submit them under one batch id.
+        """Submit several files under one batch id.
 
-        Each path is uploaded through the same three-step pipeline as
-        parse_document and submitted with the shared batch_id; the jobs start
-        queued and are polled individually with get_job / get_batch.
+        Provide exactly one of paths (server-local files, uploaded through the
+        same three-step pipeline as parse_document) or file_ids (already
+        uploaded via PUT /uploads). The jobs start queued and are polled
+        individually with get_job / get_batch.
         """
         if not _BATCH_ID_RE.fullmatch(batch_id):
             raise ToolError(
@@ -382,16 +393,25 @@ class Tools:
             )
         if ocr_mode not in OCR_MODES:
             raise ToolError(f"ocr_mode must be one of {list(OCR_MODES)}")
-        if not paths:
-            raise ToolError("paths must contain at least one file")
-        if len(paths) > _MAX_BATCH_FILES:
+        if (paths is None) == (file_ids is None):
+            raise ToolError("provide exactly one of paths or file_ids")
+        sources = paths if paths is not None else file_ids
+        assert sources is not None
+        if not sources:
+            raise ToolError("paths/file_ids must contain at least one file")
+        if len(sources) > _MAX_BATCH_FILES:
             raise ToolError(f"a batch is limited to {_MAX_BATCH_FILES} files")
+        if paths is not None:
+            self._check_local_path_enabled("batch")
         start = monotonic_ms()
         jobs: list[dict[str, Any]] = []
         try:
             await self.tiers.validate(tier)
-            for path in paths:
-                file_id, _sha, _size = await self._source_to_file(path, None)
+            for source in sources:
+                if paths is not None:
+                    file_id, _sha, _size = await self._source_to_file(source, None)
+                else:
+                    file_id = source
                 job = await self.client.create_job(
                     file_id, tier, ocr_mode, batch_id=batch_id
                 )
@@ -406,7 +426,7 @@ class Tools:
         log_event(
             "submit_batch",
             batch_id=batch_id,
-            files=len(paths),
+            files=len(sources),
             tier=tier,
             duration_ms=round(monotonic_ms() - start, 1),
         )
@@ -506,6 +526,7 @@ class Tools:
         self,
         path: str | None = None,
         url: str | None = None,
+        file_id: str | None = None,
         tier: str = "basic",
         ocr_mode: str = "auto",
         wait_seconds: int | None = None,
@@ -524,7 +545,7 @@ class Tools:
         start = monotonic_ms()
         try:
             await self.tiers.validate(tier)
-            file_id, sha, size = await self._source_to_file(path, url)
+            file_id, sha, size = await self._resolve_source(path, url, file_id)
             job = await self.client.create_job(file_id, tier, ocr_mode)
             job_id = job.get("job_id")
             if not job_id:
@@ -574,6 +595,30 @@ class Tools:
             duration_ms=round(monotonic_ms() - start, 1),
         )
         return result
+
+    async def _resolve_source(
+        self, path: str | None, url: str | None, file_id: str | None
+    ) -> tuple[str, str | None, int | None]:
+        """Turn exactly one of path / url / file_id into a gateway file id."""
+        provided = [source for source in (path, url, file_id) if source is not None]
+        if len(provided) != 1:
+            raise ToolError("provide exactly one of path, url or file_id")
+        if file_id is not None:
+            try:
+                meta = await self.client.get_file_meta(file_id)
+            except UpstreamError as exc:
+                raise _map_upstream_error(exc) from exc
+            return file_id, meta.get("sha256sum"), meta.get("bytes")
+        self._check_local_path_enabled(path)
+        return await self._source_to_file(path, url)
+
+    def _check_local_path_enabled(self, path: str | None) -> None:
+        """Remote deployments cannot see client paths; point at PUT /uploads."""
+        if path is not None and not self.settings.enable_local_path:
+            raise ToolError(
+                "path refers to a file on the MCP server, not on the client, "
+                "and local paths are disabled in this deployment; " + UPLOAD_HINT
+            )
 
     async def _source_to_file(
         self, path: str | None, url: str | None
@@ -675,12 +720,15 @@ _CANCEL_JOB_DESCRIPTION = (
 
 
 _PARSE_DOCUMENT_DESCRIPTION = (
-    "Parse a document into markdown and structured JSON. Upload a local file "
-    "(path) or fetch a URL (url) — exactly one of the two — then submit it to "
-    "ThinkParse and wait up to wait_seconds for the result. wait_seconds=0 "
-    "returns immediately with the job id; poll with get_job afterwards. A "
-    "failed parse is returned as status='failed' with error details, not as "
-    "an exception."
+    "Parse a document into markdown and structured JSON. Provide exactly one "
+    "source: file_id (a file already uploaded to this server via "
+    "PUT /uploads?filename=<name> with the same Bearer token — the way to "
+    "parse a client-local file of any size), url (a public URL the server "
+    "fetches), or path (a file on the MCP server itself; only enabled in "
+    "local/mounted deployments). Submits the job and waits up to wait_seconds "
+    "for the result. wait_seconds=0 returns immediately with the job id; poll "
+    "with get_job afterwards. A failed parse is returned as status='failed' "
+    "with error details, not as an exception."
 )
 
 
@@ -693,10 +741,12 @@ _GET_RESULT_DESCRIPTION = (
 )
 
 _SUBMIT_BATCH_DESCRIPTION = (
-    "Parse several local files under one batch: uploads each path, submits "
-    "each as a job sharing the same batch_id (1-64 chars of letters, digits, "
-    "'_' or '-'), and returns the created job ids. Poll individual jobs with "
-    "get_job, or summarize the whole batch with get_batch."
+    "Parse several files under one batch: provide exactly one of file_ids "
+    "(files already uploaded via PUT /uploads) or paths (server-local files, "
+    "only in local/mounted deployments). Submits each as a job sharing the "
+    "same batch_id (1-64 chars of letters, digits, '_' or '-') and returns "
+    "the created job ids. Poll individual jobs with get_job, or summarize "
+    "the whole batch with get_batch."
 )
 
 _GET_BATCH_DESCRIPTION = (
@@ -750,6 +800,7 @@ def register_tools(server: "MCPServer", tools: Tools) -> None:
     async def parse_document(
         path: str | None = None,
         url: str | None = None,
+        file_id: str | None = None,
         tier: str = "basic",
         ocr_mode: str = "auto",
         wait_seconds: int | None = None,
@@ -760,6 +811,7 @@ def register_tools(server: "MCPServer", tools: Tools) -> None:
             lambda: tools.parse_document(
                 path=path,
                 url=url,
+                file_id=file_id,
                 tier=tier,
                 ocr_mode=ocr_mode,
                 wait_seconds=wait_seconds,
@@ -784,15 +836,16 @@ def register_tools(server: "MCPServer", tools: Tools) -> None:
 
     @server.tool(name="submit_batch", description=_SUBMIT_BATCH_DESCRIPTION)
     async def submit_batch(
-        paths: list[str],
         batch_id: str,
+        paths: list[str] | None = None,
+        file_ids: list[str] | None = None,
         tier: str = "basic",
         ocr_mode: str = "auto",
     ) -> dict[str, Any]:
         return await _counting(
             "submit_batch",
             lambda: tools.submit_batch(
-                paths, batch_id, tier=tier, ocr_mode=ocr_mode
+                paths, batch_id, tier=tier, ocr_mode=ocr_mode, file_ids=file_ids
             ),
         )
 

@@ -75,7 +75,8 @@ async def test_registered_parse_document_passes_context(tmp_path, monkeypatch):
     seen = {}
 
     async def spy(
-        path=None, url=None, tier="basic", ocr_mode="auto", wait_seconds=None, ctx=None
+        path=None, url=None, file_id=None, tier="basic", ocr_mode="auto",
+        wait_seconds=None, ctx=None,
     ):
         seen["ctx"] = ctx
         return {"job_id": "job_1", "status": "completed"}

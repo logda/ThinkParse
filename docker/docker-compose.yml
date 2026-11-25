@@ -227,6 +227,13 @@ services:
       THINKPARSE_API_KEY: ${THINKPARSE_API_KEY:-}
       MCP_TRANSPORT: streamable-http
       MCP_TRUSTED_PROXY_CIDRS: ${MCP_TRUSTED_PROXY_CIDRS:-10.0.0.0/8}
+      MCP_STATIC_TOKEN: ${MCP_STATIC_TOKEN:-}
+      # Clients upload files with PUT /uploads?filename=<name> (same Bearer
+      # token) and submit parse_document(file_id=...); no host mount needed.
+      # For local/mounted deployments only: set MCP_ALLOWED_ROOT, mount the
+      # directory, and optionally MCP_ENABLE_LOCAL_PATH=1 to allow path args.
+      MCP_ALLOWED_ROOT: ${MCP_ALLOWED_ROOT:-}
+      MCP_ENABLE_LOCAL_PATH: ${MCP_ENABLE_LOCAL_PATH:-}
     ports: ["127.0.0.1:8765:8765"]
     read_only: true
     tmpfs: ["/tmp"]

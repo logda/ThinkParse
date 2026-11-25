@@ -42,6 +42,8 @@ class Settings:
     allowed_ports: frozenset[int] = frozenset({80, 443})
     max_upload_bytes: int | None = None
     download_deadline_s: float = 120.0
+    upload_deadline_s: float = 120.0
+    enable_local_path: bool = False
     poll_interval_s: float = 1.0
     poll_max_interval_s: float = 5.0
     default_wait_s: int = 30
@@ -113,6 +115,23 @@ class Settings:
         if download_deadline_s <= 0:
             raise ConfigError("MCP_DOWNLOAD_DEADLINE_S must be positive")
 
+        upload_deadline_s = _float(
+            source.get("MCP_UPLOAD_DEADLINE_S", _DEFAULT_DOWNLOAD_DEADLINE_S),
+            "MCP_UPLOAD_DEADLINE_S",
+        )
+        if upload_deadline_s <= 0:
+            raise ConfigError("MCP_UPLOAD_DEADLINE_S must be positive")
+
+        # Local path arguments read files on the MCP server itself, so they
+        # only make sense when the operator mounted a workspace and configured
+        # MCP_ALLOWED_ROOT. Remote deployments upload via PUT /uploads instead;
+        # MCP_ENABLE_LOCAL_PATH overrides the roots-derived default either way.
+        enable_local_path = _bool(
+            source.get("MCP_ENABLE_LOCAL_PATH"),
+            "MCP_ENABLE_LOCAL_PATH",
+            default=bool(allowed_roots),
+        )
+
         return cls(
             base_url=base_url,
             api_key=api_key,
@@ -129,6 +148,8 @@ class Settings:
                 "MCP_MAX_UPLOAD_BYTES",
             ),
             download_deadline_s=download_deadline_s,
+            upload_deadline_s=upload_deadline_s,
+            enable_local_path=enable_local_path,
             poll_interval_s=poll_interval_s,
             poll_max_interval_s=_MAX_POLL_INTERVAL_S,
             default_wait_s=default_wait_s,
@@ -166,3 +187,14 @@ def _float(raw: str, name: str) -> float:
         return float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
+
+
+def _bool(raw: str | None, name: str, default: bool) -> bool:
+    if raw is None or not raw.strip():
+        return default
+    lowered = raw.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{name} must be a boolean (1/0/true/false), got {raw!r}")

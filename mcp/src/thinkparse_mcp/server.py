@@ -38,7 +38,11 @@ def create_mcp(
         instructions=(
             "Parse PDF and image documents through a private ThinkParse "
             "gateway. Submit, poll, paginate results, and cancel without "
-            "blocking the conversation."
+            "blocking the conversation. To parse a file that lives on the "
+            "client, upload it first: PUT the raw bytes to /uploads?filename="
+            "<name> on this server (same Bearer token, Content-Length "
+            "required), then call parse_document(file_id=...). The url "
+            "parameter fetches a public URL server-side instead."
         ),
         log_level=settings.log_level,
     )
@@ -72,20 +76,26 @@ def create_mcp(
 
     if tools is not None:
         from . import tools as tools_module
+        from .upload import handle_upload
 
         tools_module.register_tools(server, tools)
+
+        @server.custom_route("/uploads", methods=["PUT"])
+        async def uploads(request: Request) -> JSONResponse:
+            return await handle_upload(request, tools, settings)
+
     return server
 
 
 def identity_middleware(app, settings: Settings):
-    """Pure ASGI wrapper: authenticate /mcp, leave every other path alone.
+    """Pure ASGI wrapper: authenticate /mcp and /uploads, leave the rest alone.
 
     The resolved identity lands in ``scope["state"]["user"]`` for logging;
     stdio has no middleware path, so tools log ``local`` there instead.
     """
 
     async def middleware(scope, receive, send):
-        if scope["type"] != "http" or scope.get("path", "") != "/mcp":
+        if scope["type"] != "http" or scope.get("path", "") not in ("/mcp", "/uploads"):
             await app(scope, receive, send)
             return
         headers = Headers(scope=scope)

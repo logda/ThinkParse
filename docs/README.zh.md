@@ -16,6 +16,7 @@ ThinkParse 是开源的**企业级文档解析系统**：统一 API、持久任�
 |---|---|
 | [架构](architecture.zh.md) | 系统设计、引擎、数据模型、协调与投影 |
 | [API 参考](api.zh.md) | `/api/v1` 与 `/api/v2` |
+| [MCP 接入](mcp.zh.md) | Agent 客户端连接、文件上传与解析工具 |
 | [运维与算力](operations.zh.md) | 多 GPU、槽位、在途字节、批次与统计 |
 | [文件清理](cleanup.zh.md) | 上传、临时文件、解析结果的存放位置和清理期限 |
 

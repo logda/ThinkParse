@@ -5,6 +5,9 @@ on:
     branches: [main, develop, "release/**"]
   pull_request:
 
+# All commands live in the Makefile; this workflow only dispatches targets,
+# so local `make ci` and CI run exactly the same checks.
+
 jobs:
   test:
     name: Control plane tests
@@ -22,10 +25,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r control/requirements-dev.txt
 
-      - name: Test and lint
-        run: |
-          PYTHONPATH=. python -m unittest discover -s tests -p 'test_control_*.py'
-          ruff check control tests
+      - name: Lint and test
+        run: make lint test
 
   docker-build:
     name: Control plane image
@@ -37,12 +38,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build gateway image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./control/Dockerfile
-          push: false
-          tags: thinkparse-control:test
+        run: make docker-build-control CONTROL_IMAGE=thinkparse-control:test
 
   mcp-test:
     name: MCP server tests
@@ -58,10 +54,8 @@ jobs:
       - name: Install uv
         run: python -m pip install --upgrade pip uv
 
-      - name: Test and lint
-        run: |
-          uv --directory mcp run pytest
-          uv --directory mcp run ruff check src tests
+      - name: Lint and test
+        run: make lint-mcp test-mcp
 
   mcp-docker-build:
     name: MCP server image
@@ -73,9 +67,4 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build MCP image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./mcp
-          file: ./mcp/Dockerfile
-          push: false
-          tags: thinkparse-mcp:test
+        run: make docker-build-mcp MCP_IMAGE=thinkparse-mcp:test
